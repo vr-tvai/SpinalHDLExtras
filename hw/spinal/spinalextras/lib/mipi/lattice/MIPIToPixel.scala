@@ -28,10 +28,7 @@ case class MIPIToPixel(cfg : MIPIConfig,
 
     val pixelFlow = master(Flow(Fragment(Vec(Bits(cfg.PIX_WIDTH bits), cfg.outputLanes))))
 
-    /**
-     * Header events in the Soft-DPHY **byte** clock domain (`lp_en`/`sp_en`).
-     * Cross to the stats/CPU domain with StreamCC (see TinyvisionCameraBoard).
-     */
+    /** Header events in Soft-DPHY byte clock domain. */
     val mipi_header = master Flow(MIPIPacketHeader())
 
     /** Frame-valid in pixel_cd (for PTS latch via level CDC into the UVC clock). */
@@ -47,8 +44,7 @@ case class MIPIToPixel(cfg : MIPIConfig,
   }
 
   noIoPrefix()
-  // No-LMMI Soft-DPHY hardcodes settle / pkt delay in the Soft-IP wrapper
-  // Only expose those parallel ports when LMMI is on (DYN_*).
+  // Parallel settle/pktdly only when those Soft-DPHY pins exist.
   val mipi_to_bytes = new dphy_rx(cfg,
     sync_cd = sync_cd,
     byte_cd = byte_cd,
@@ -70,8 +66,6 @@ case class MIPIToPixel(cfg : MIPIConfig,
   mipi_to_bytes.io.tx_rdy_i := io.tx_rdy
   // ref_dt_i is left to its port default (cfg.refDt.id). When attach_bus() is called it
   // is overridden by the runtime-writable ref_dt register (see dphy_rx.attach_bus).
-  // Soft-DPHY LMMI variant has no parallel ref_dt / vcx / dropnull pins.
-
   if (mipi_to_bytes.io.rxcsr_dropnull_i != null) {
     mipi_to_bytes.io.rxcsr_dropnull_i := False
   }
@@ -87,9 +81,7 @@ case class MIPIToPixel(cfg : MIPIConfig,
 
   io.mipi_header << mipiHdr
 
-  // PixelFlow2Fragment / io.pixelFlow must run in pixel_cd. MIPIToPixel is often
-  // elaborated under the CPU ClockDomain; without this area the fragment path is
-  // tagged CPU while byte2pixel drives pixel_cd → PhaseCheckCrossClock.
+  // Fragment path must be in pixel_cd (toplevel is often CPU cd).
   new ClockingArea(pixel_cd) {
     io.frame_valid := bytes_to_pixels.io.pixelFlow.frame_valid
     io.pixelFlow <> PixelFlow2Fragment(bytes_to_pixels.io.pixelFlow).map(f => {

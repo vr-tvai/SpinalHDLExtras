@@ -8,7 +8,6 @@ import spinal.lib.bus.misc.BusSlaveFactory
 import spinal.lib.bus.regif.AccessType._
 import spinal.lib.bus.regif.{BusIf, RegInst, SymbolName}
 import spinalextras.lib.bus.LMMI
-import spinalextras.lib.Constraints
 import spinalextras.lib.logging.{FlowLogger, GlobalLogger, SignalLogger}
 import spinalextras.lib.mipi.{MIPIConfig, MIPIIO, MIPIPacketHeader}
 import spinalextras.lib.misc.{AsyncToSyncReset, ClockMeasure, GlobalSignals}
@@ -452,14 +451,6 @@ class dphy_rx(cfg : MIPIConfig,
   noIoPrefix()
   setDefinitionName(ip_name)
 
-  // Soft-DPHY recovered HS byte clock - always register for SDC.
-  // Continuous mode: this is the freerunning byte clock as well.
-  // Discontinuous (HS_LP): freerunning byte comes from PLL (additionalClocks);
-  // clk_byte_hs_o is still a real HS-domain clock (ClockMeasure, Soft-DPHY HS path).
-  addPrePopTask(() => {
-    Constraints.create_clock(io.clk_byte_hs_o, byte_freq)
-  })
-
   Component.push(parent)
   attachClockDomains(sync_cd, byte_cd)
 
@@ -483,16 +474,6 @@ class dphy_rx(cfg : MIPIConfig,
   /**
    * Fixed CSI Soft-DPHY CSR map (byte offsets from window base).
    * Keep in sync with Zephyr tvai_csi.h.
-   *
-   *   +0x00 signature
-   *   +0x04 clk_meas_long
-   *   +0x08 clk_meas_short
-   *   +0x0c rxcsr_datsettlecyc (RW)
-   *   +0x10 ref_dt (RW) — filter for lp_av_en_o
-   *   +0x14 rxcsr_rxfifo_pktdly (RW)
-   *   +0x18.. WC counters when withErrorCounters
-   *   +0x64 last_lp_dt (RO) — last long-packet dt_o on the wire
-   *   +0x68 crc_check_o / +0x6c crc_error_o (WC; Soft-DPHY CRC_CHECK)
    */
   def attach_bus(busSlaveFactory: BusIf, withErrorCounters: Boolean = true): Unit = {
     Component.current.withAutoPull()
@@ -548,23 +529,6 @@ class dphy_rx(cfg : MIPIConfig,
         GlobalSignals.externalize(io.packet_parser.ref_dt_i) :=
           crossClock(ref_dt_ctrl, ref_dt, io.byte_clock_domain(), default_ref_dt).asBits
       }
-
-      /*
-       * Observed long-packet DT from the sensor (Soft-DPHY dt_o @ lp_en_o).
-       * Independent of ref_dt — use to verify shrimp MIPI DT vs filter.
-       */
-      val last_lp_dt_reg = busSlaveFactory.newRegAt(base + dphy_rx.OffLastLpDt, "last_lp_dt")(
-        SymbolName("last_lp_dt"))
-      val last_lp_dt = last_lp_dt_reg.field(UInt(6 bits), RO,
-        "Last MIPI data type from a long packet (wire dt_o when lp_en_o). Compare to ref_dt.")
-      val lastLpDtByte = new ClockingArea(io.byte_clock_domain()) {
-        val r = Reg(UInt(6 bits)) init 0
-        when(io.packet_parser.lp_en_o) {
-          r := io.packet_parser.dt_o
-        }
-        r
-      }.r
-      last_lp_dt := BufferCC(lastLpDtByte)
     }
 
     if (io.rxcsr_rxfifo_pktdly_i != null) {
@@ -576,29 +540,7 @@ class dphy_rx(cfg : MIPIConfig,
     }
 
     if (withErrorCounters && enable_misc_signals && enable_packet_parser) {
-      /*
-       * Soft-DPHY status pulses live in the byte-clock domain. Lattice IPUG:
-       * ECC/CRC error flags are only valid while *_check_o is asserted.
-       * Counting via BufferCC(error) in the CSR clock misses those short pulses
-       * (and settles look like they have no effect). Capture in byte clock, PulseCC.
-       */
-      val byteCd = io.byte_clock_domain()
-
-      def riseInByte(sig: Bool): Bool = new ClockingArea(byteCd) {
-        val r = sig.rise(False)
-      }.r
-
-      def wcAtBytePulse(offset: Int, pulseByte: Bool, name: String): Unit = {
-        val reg = busSlaveFactory.newRegAt(base + offset, name)(SymbolName(name))
-        val cnt = reg.field(UInt(32 bits), WC, name)(SymbolName(s"${name}_cnt")) init (0)
-        val pulseSys = PulseCCByToggle(pulseByte, clockIn = byteCd, clockOut = ClockDomain.current)
-        when(pulseSys) {
-          cnt := cnt + 1
-        }
-      }
-
-      /** Long-lived Soft-DPHY levels (e.g. payload_en): CSR ticks while BufferCC high. */
-      def wcAtLevelCc(offset: Int, signal: Bool, name: String): Unit = {
+      def wcAt(offset: Int, signal: Bool, name: String): Unit = {
         val reg = busSlaveFactory.newRegAt(base + offset, name)(SymbolName(name))
         val cnt = reg.field(UInt(32 bits), WC, name)(SymbolName(s"${name}_cnt")) init (0)
         when(BufferCC(signal)) {
@@ -606,39 +548,30 @@ class dphy_rx(cfg : MIPIConfig,
         }
       }
 
-      wcAtBytePulse(dphy_rx.OffHsSyncRise, riseInByte(io.hs_sync_o), "hs_sync_rise")
-      wcAtBytePulse(0x1c, riseInByte(io.misc_signals.term_clk_en_o), "term_clk_en_rise")
-      wcAtBytePulse(0x20, riseInByte(io.misc_signals.term_d_en_o(0)), "term_d_en_o0")
-      wcAtLevelCc(0x24, io.misc_signals.hs_d_en_o, "hs_d_en_o")
-      wcAtLevelCc(0x28, io.misc_signals.cd_clk_o, "cd_clk_o")
-      wcAtLevelCc(0x2c, io.misc_signals.cd_d0_o, "cd_d0_o")
-
-      // ECC: error flags valid only while ecc_check_o is asserted (IPUG).
-      val eccCheck = io.packet_parser.ecc_info.valid
-      wcAtBytePulse(0x30, riseInByte(eccCheck), "ecc_check_o")
-      wcAtBytePulse(dphy_rx.OffEcc1bit, riseInByte(eccCheck && io.packet_parser.ecc_info.payload(0)), "ecc_1bit_error_o")
-      wcAtBytePulse(dphy_rx.OffEcc2bit, riseInByte(eccCheck && io.packet_parser.ecc_info.payload(1)), "ecc_2bit_error_o")
-      wcAtBytePulse(dphy_rx.OffEccByte, riseInByte(eccCheck && io.packet_parser.ecc_info.payload(2)), "ecc_byte_error_o")
-
-      wcAtLevelCc(dphy_rx.OffPayloadEn, io.packet_parser.payload_en_o, "payload_en_o")
-      wcAtBytePulse(0x44, riseInByte(io.packet_parser.lp_en_o), "lp_en_o")
-      wcAtBytePulse(dphy_rx.OffLpAvEn, riseInByte(io.packet_parser.lp_av_en_o), "lp_av_en_o")
-      wcAtBytePulse(0x4c, riseInByte(io.packet_parser.sp_en_o), "sp_en_o")
-      wcAtBytePulse(dphy_rx.OffPayloadCrcVld, riseInByte(io.packet_parser.payload_crcvld_o), "payload_crcvld_o")
+      wcAt(dphy_rx.OffHsSyncRise, BufferCC(io.hs_sync_o).rise(), "hs_sync_rise")
+      wcAt(0x1c, BufferCC(io.misc_signals.term_clk_en_o).rise(), "term_clk_en_rise")
+      wcAt(0x20, BufferCC(io.misc_signals.term_d_en_o(0)).rise(), "term_d_en_o0")
+      wcAt(0x24, io.misc_signals.hs_d_en_o, "hs_d_en_o")
+      wcAt(0x28, io.misc_signals.cd_clk_o, "cd_clk_o")
+      wcAt(0x2c, io.misc_signals.cd_d0_o, "cd_d0_o")
+      wcAt(0x30, io.packet_parser.ecc_info.valid, "ecc_check_o")
+      wcAt(dphy_rx.OffEcc1bit, io.packet_parser.ecc_info.payload(0), "ecc_1bit_error_o")
+      wcAt(dphy_rx.OffEcc2bit, io.packet_parser.ecc_info.payload(1), "ecc_2bit_error_o")
+      wcAt(dphy_rx.OffEccByte, io.packet_parser.ecc_info.payload(2), "ecc_byte_error_o")
+      wcAt(dphy_rx.OffPayloadEn, io.packet_parser.payload_en_o, "payload_en_o")
+      wcAt(0x44, io.packet_parser.lp_en_o, "lp_en_o")
+      wcAt(dphy_rx.OffLpAvEn, io.packet_parser.lp_av_en_o, "lp_av_en_o")
+      wcAt(0x4c, io.packet_parser.sp_en_o, "sp_en_o")
+      wcAt(dphy_rx.OffPayloadCrcVld, io.packet_parser.payload_crcvld_o, "payload_crcvld_o")
 
       val fifoOvflw = if (io.fifo_misc_signals != null) io.fifo_misc_signals.fifo_ovflw_err_o else False
       val rxqueFull = if (io.fifo_misc_signals != null) io.fifo_misc_signals.rxque_full_o else False
       val rxfull0 = if (io.fifo_misc_signals != null) io.fifo_misc_signals.rxfullfr0_o else False
       val rxfull1 = if (io.fifo_misc_signals != null) io.fifo_misc_signals.rxfullfr1_o else False
-      wcAtBytePulse(dphy_rx.OffFifoOvflw, riseInByte(fifoOvflw), "fifo_ovflw_err_o")
-      wcAtBytePulse(0x58, riseInByte(rxqueFull), "rxque_full_o")
-      wcAtBytePulse(0x5c, riseInByte(rxfull0), "rxfullfr0_o")
-      wcAtBytePulse(0x60, riseInByte(rxfull1), "rxfullfr1_o")
-
-      // CRC: same validity rule as ECC (check qualifies error).
-      val crcCheck = io.packet_parser.crc_check_o
-      wcAtBytePulse(dphy_rx.OffCrcCheck, riseInByte(crcCheck), "crc_check_o")
-      wcAtBytePulse(dphy_rx.OffCrcError, riseInByte(crcCheck && io.packet_parser.crc_error_o), "crc_error_o")
+      wcAt(dphy_rx.OffFifoOvflw, fifoOvflw, "fifo_ovflw_err_o")
+      wcAt(0x58, rxqueFull, "rxque_full_o")
+      wcAt(0x5c, rxfull0, "rxfullfr0_o")
+      wcAt(0x60, rxfull1, "rxfullfr1_o")
     }
   }
 }
@@ -658,11 +591,6 @@ object dphy_rx {
   val OffLpAvEn = 0x48
   val OffPayloadCrcVld = 0x50
   val OffFifoOvflw = 0x54
-  /** RO: last long-packet MIPI DT observed on the wire (after WC block @ 0x60). */
-  val OffLastLpDt = 0x64
-  /** WC: Soft-DPHY CRC evaluation / mismatch pulses (CRC_CHECK_IN). */
-  val OffCrcCheck = 0x68
-  val OffCrcError = 0x6c
   val WindowBytes = 0x100
   /** Wishbone window for Soft-DPHY LMMI (256 byte offsets × 4-byte word spacing). */
   val LmmiWindowBytes = 0x400
