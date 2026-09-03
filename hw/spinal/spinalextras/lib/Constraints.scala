@@ -2,14 +2,11 @@ package spinalextras.lib
 
 import spinal.core._
 import spinal.core.internals.{PhaseContext, PhaseNetlist}
-import spinal.lib.bus.amba3.apb.Apb3CC
-import spinal.lib.bus.amba4.axi.{Axi4CC, Axi4ReadOnlyCC, Axi4WriteOnlyCC}
 import spinal.lib.{
   BufferCC,
   FlowCCByToggle,
   FlowCCUnsafeByToggle,
   KeepAttribute,
-  PulseCCByToggle,
   StreamCCByToggle,
   StreamFifoCC
 }
@@ -141,7 +138,6 @@ class Constraints {
     }
 
     def hasPort(n: String) = report.toplevel.getAllIo.exists(_.getName() == n)
-    def presentPorts(ns: String*) = ns.filter(hasPort)
 
     for ((data, freq) <- clocks) {
       if (generated_clocks.exists(_._1 == data)) {
@@ -183,56 +179,10 @@ class Constraints {
       file.println(s"set_clock_groups -asynchronous -group [get_clocks {${spiClockName.get}}] -group [get_clocks {${pllGenNames.mkString(" ")}}]")
     }
 
-    // set_clock_uncertainty belongs on the board SDC (fpga_top_som /
-    // usb_accessory_board), not IP emit.
+    // Pad false_paths / JTAG-SPI I/O delays / pad max_skew belong on board SDC.
 
-    for (n <- presentPorts("led", "uart_txd")) {
-      file.println(s"set_false_path -to [get_ports {$n}]")
-    }
-    for (n <- presentPorts("uart_rxd")) {
-      file.println(s"set_false_path -from [get_ports {$n}]")
-    }
-    for (n <- presentPorts("scl", "sda")) {
-      file.println(s"set_false_path -from [get_ports {$n}]")
-      file.println(s"set_false_path -to [get_ports {$n}]")
-    }
-    if (hasPort("jtag_tck")) {
-      for (n <- presentPorts("jtag_tdi", "jtag_tms")) {
-        file.println(s"set_input_delay -clock [get_clocks {jtag_tck}] -max 10.0 [get_ports {$n}]")
-        file.println(s"set_input_delay -clock [get_clocks {jtag_tck}] -min 2.0 [get_ports {$n}]")
-      }
-      if (hasPort("jtag_tdo")) {
-        file.println("set_output_delay -clock [get_clocks {jtag_tck}] -max 10.0 [get_ports {jtag_tdo}]")
-        file.println("set_output_delay -clock [get_clocks {jtag_tck}] -min 2.0 [get_ports {jtag_tdo}]")
-      }
-    }
-    // Pad I/O delays belong on the board SDC. Emit them from the IP only when
-    // the generated SCK is still the `spiflash_clk` port (unobfuscated top).
-    if (spiClockName.contains("spiflash_clk") && hasPort("spiflash_dq")) {
-      file.println("set_input_delay -clock [get_clocks {spiflash_clk}] -clock_fall -max 6.0 [get_ports {spiflash_dq*}]")
-      file.println("set_input_delay -clock [get_clocks {spiflash_clk}] -clock_fall -min 1.5 [get_ports {spiflash_dq*}]")
-      file.println("set_output_delay -clock [get_clocks {spiflash_clk}] -max 2.0 [get_ports {spiflash_dq*}]")
-      file.println("set_output_delay -clock [get_clocks {spiflash_clk}] -min -3.0 [get_ports {spiflash_dq*}]")
-    }
-    if (spiClockName.contains("spiflash_clk") && hasPort("spiflash_cs_n")) {
-      file.println("set_output_delay -clock [get_clocks {spiflash_clk}] -max 5.0 [get_ports {spiflash_cs_n}]")
-      file.println("set_output_delay -clock [get_clocks {spiflash_clk}] -min -3.0 [get_ports {spiflash_cs_n}]")
-    }
-    // Do not emit Spinal-hierarchy leftovers (cpol/cpha, brightness_ret,
-    // mipi_to_bytes_cd_d0_o_regNext). Those names die at obfuscate/flatten;
-    // pad false_paths and CDC globs cover the same intent.
-
-    //    for ((clks, async) <- clock_groups) {
-    //      file.println(s"set_clock_groups ${clks.map("-group [get_clocks {" + _.name +"}]").mkString(" ")} ${if(async) "-asynchronous" else ""}")
-    //    }
-
-    if (hasPort("jtag_tck") && presentPorts("jtag_tdi", "jtag_tms").size == 2) {
-      // Radiant set_max_skew accepts nets, not get_ports. Omit jtag_tdo*:
-      // at IP CPE scope that glob is empty and 1026001 (CPE then segfaults).
-      file.println("set_max_skew [get_nets {jtag_tck* jtag_tdi* jtag_tms*}] 10.0")
-    }
-    if (hasPort("spiflash_clk") && hasPort("spiflash_cs_n") && hasPort("spiflash_dq")) {
-      file.println("set_max_skew [get_nets {spiflash_clk* spiflash_cs_n* spiflash_dq*}] 1.0")
+    for ((datas, skew) <- max_skews) {
+      file.println(s"set_max_skew [get_nets {${datas.map(_.getRtlPath() + "*").mkString(" ")}}] ${skew.toDouble * 1e9}")
     }
 
     for ((datas, delay) <- min_delay) {
@@ -347,19 +297,9 @@ object Constraints {
     case _                         => false
   }
 
-  /**
-   * CDC wrappers / async FIFOs. Keep hierarchy + KeepName so children and RAM
-   * pins stay findable; do not use the cdc_ prefix ( *cdc_* through would TIG
-   * same-clock toggle / FIFO payload). Nested BufferCC still get markCdcAnchor.
-   */
   def isCdcContainer(c: Component): Boolean = c match {
-    case _: StreamFifoCC[_]    => true
-    case _: PulseCCByToggle    => true
-    case _: Axi4CC             => true
-    case _: Axi4ReadOnlyCC     => true
-    case _: Axi4WriteOnlyCC    => true
-    case _: Apb3CC             => true
-    case _                     => false
+    case _: StreamFifoCC[_] => true
+    case _                  => false
   }
 
   def cdcGlobFor(c: Component): String = c match {

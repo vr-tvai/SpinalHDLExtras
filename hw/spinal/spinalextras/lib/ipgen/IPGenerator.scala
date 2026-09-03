@@ -301,7 +301,7 @@ abstract class IPGenerator_[CFG : ClassTag] extends IPGenerator {
       }
     }
 
-    Spinex.generate_ipx(report, obfuscate = options.obfuscate)
+    Spinex.generate_ipx(report)
 
     {
       import scala.sys.process._
