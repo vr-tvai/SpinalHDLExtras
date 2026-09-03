@@ -50,13 +50,16 @@ case class Spinex(config : SpinexConfig = SpinexConfig.default) extends Componen
 
   val resetCtrl = new ClockingArea(resetCtrlClockDomain) {
     val mainClkResetUnbuffered  = False
+    /** Driven by board/top (e.g. TinyvisionTopLevel `Rcc.io.cpuResetPulse`).
+      * Re-arms the 10 us POR so XIP/SoC re-init. Default untied False. */
+    val softwareReset = False
 
     val systemClkReset = Timeout(10 us)
     when(!systemClkReset) {
       mainClkResetUnbuffered := True
     }
 
-    when(mainClockDomain.isResetActive) {
+    when(mainClockDomain.isResetActive || softwareReset) {
       systemClkReset.clear()
       mainClkResetUnbuffered := True
     }
@@ -101,12 +104,20 @@ case class Spinex(config : SpinexConfig = SpinexConfig.default) extends Componen
         )
     }
 
-    //Instanciate the CPU
-    val cpu = new VexRiscv(
-      config = VexRiscvConfig(
-        plugins = cpuPlugins,
-      )
+    // Hart-only reset; interconnect stays on systemReset. Board/top drives
+    // this from Rcc (same pulse as resetCtrl.softwareReset).
+    val cpuSoftReset = False
+    val cpuClockDomain = systemClockDomain.copy(
+      reset = systemClockDomain.readResetWire || cpuSoftReset
     )
+    cpuClockDomain.setSynchronousWith(systemClockDomain)
+    val cpu = cpuClockDomain on {
+      new VexRiscv(
+        config = VexRiscvConfig(
+          plugins = cpuPlugins,
+        )
+      )
+    }
 
     //Checkout plugins used to instanciate the CPU to connect them to the SoC
     val timerInterrupt = False
