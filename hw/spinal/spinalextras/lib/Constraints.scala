@@ -65,12 +65,12 @@ class Constraints {
   // Flatten + obfuscate drop Spinal hierarchy. PLL / Soft-DPHY blackbox pin
   // names (CLKOP, clk_byte_hs_o) and top ports survive; do not glob CLKOS as
   // a net prefix (that also matches CLKOS2 / CLKOS3).
+  // Use dest/source RtlPath (e.g. pLL_1/CLKOP), not a hardcoded instance.
+  // */CLKOP alone matches AXI CLKOP ports and CPE segfaults.
   private def generatedClockDest(dest: Data, toplevel: Component): String = {
     val leaf = portLeaf(dest)
     if (isPllGeneratedDest(dest)) {
-      // */CLKOP matches every AXI clock port named CLKOP and CPE segfaults.
-      // PLL blackbox instance is Spinal pLL_1 (module PLL).
-      s"[get_pins -hierarchical {*pLL_1/${leaf}}]"
+      s"[get_pins -hierarchical {*${dest.getRtlPath()}}]"
     } else if (toplevel.getAllIo.exists(_.getName() == "spiflash_clk") && !isPllGeneratedDest(dest)) {
       "[get_ports {spiflash_clk}]"
     } else if (isToplevelPort(dest, toplevel) || toplevel.getAllIo.exists(_.getName() == leaf)) {
@@ -87,13 +87,14 @@ class Constraints {
 
   private def generatedClockSource(dest: Data, source: Data, toplevel: Component): String = {
     if (isPllGeneratedDest(dest)) {
-      "[get_pins -hierarchical {*pLL_1/REFCK}]"
-    } else if (generated_clocks.exists { case (d, _, _, _) => portLeaf(d) == "CLKOS3" }) {
-      "[get_pins -hierarchical {*pLL_1/CLKOS3}]"
-    } else if (toplevel.getAllIo.exists(_.getName() == "clk")) {
-      "[get_ports {clk}]"
+      s"[get_pins -hierarchical {*${source.getRtlPath()}}]"
     } else {
-      clockTarget(source, toplevel)
+      generated_clocks.collectFirst {
+        case (d, _, _, _) if portLeaf(d) == "CLKOS3" =>
+          s"[get_pins -hierarchical {*${d.getRtlPath()}}]"
+      }.orElse {
+        if (toplevel.getAllIo.exists(_.getName() == "clk")) Some("[get_ports {clk}]") else None
+      }.getOrElse(clockTarget(source, toplevel))
     }
   }
 
@@ -182,7 +183,8 @@ class Constraints {
       file.println(s"set_clock_groups -asynchronous -group [get_clocks {${spiClockName.get}}] -group [get_clocks {${pllGenNames.mkString(" ")}}]")
     }
 
-    file.println("set_clock_uncertainty 0.125 [all_clocks]")
+    // set_clock_uncertainty belongs on the board SDC (fpga_top_som /
+    // usb_accessory_board), not IP emit.
 
     for (n <- presentPorts("led", "uart_txd")) {
       file.println(s"set_false_path -to [get_ports {$n}]")
@@ -381,11 +383,6 @@ object Constraints {
     c.ram.setName("ram")
   }
 
-  def markCdcContainer(c: Component): Unit = {
-    keep_chain(c)
-    Obfuscater.KeepName(c)
-  }
-
   // Spinal markCdcAnchor names: cdc_BufferCC / cdc_StreamCCByToggle / …
   // Do not glob bare *cdc_* — that also hits Lattice Soft-DPHY lscc_csr_cdc_*
   // and CPE can segfault expanding the collection.
@@ -398,7 +395,6 @@ object Constraints {
   // USB23 HIP INTERRUPT async out: board soft_dphy.sdc only (keeps
   // -hierarchical). Do not emit from IP SDC — CPE scopes to
   // u_flir_uab/*/INTERRUPT and misses nested USB23_1.
-  val usb23AsyncFromPinGlobs = Seq.empty[String]
 
   // USB23 HIP input leaves (databook hold TIGs). Use leaf globs (*/PIN), not
   // *USB23*/PIN: CPE scopes IP SDC under u_flir_uab/ and strips -hierarchical,
@@ -429,20 +425,6 @@ object Constraints {
   // StreamCCByToggle pop m2sPipe holds push-clock payload; -through on the
   // ccToggle nets misses paths that *end* at these regs (TWR 2026-09-03).
   val streamCcPopDataCellGlobs = Seq("*/popArea_stream_rData*")
-
-  def globToRegex(glob: String): String = {
-    glob.split("\\*", -1).map(java.util.regex.Pattern.quote).mkString(".*")
-  }
-
-  def cdcGlobCovers(rtlPath: String): Boolean = {
-    val probe = rtlPath + "/x"
-    cdcNetGlobs.exists(g => probe.matches(globToRegex(g)))
-  }
-
-  def fifoRamGlobCovers(rtlPath: String): Boolean = {
-    val probe = rtlPath + "/ram_spinal_port1[0]"
-    fifoRamCellGlobs.exists(g => probe.matches(globToRegex(g)))
-  }
 
   def addAttributeIfNeeded(d : Component, n : String, v : String): Unit = {
     if (!d.getTagsOf[Attribute].exists(a => a.getName == n)) {

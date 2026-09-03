@@ -50,7 +50,8 @@ case class Spinex(config : SpinexConfig = SpinexConfig.default) extends Componen
 
   val resetCtrl = new ClockingArea(resetCtrlClockDomain) {
     val mainClkResetUnbuffered  = False
-    /** Pulse from RCC CPU_RESET: re-arm the 10 us POR so XIP/SoC re-init. */
+    /** Driven by board/top (e.g. TinyvisionTopLevel `Rcc.io.cpuResetPulse`).
+      * Re-arms the 10 us POR so XIP/SoC re-init. Default untied False. */
     val softwareReset = False
 
     val systemClkReset = Timeout(10 us)
@@ -103,7 +104,8 @@ case class Spinex(config : SpinexConfig = SpinexConfig.default) extends Componen
         )
     }
 
-    // Extra reset is hart-only; interconnect stays on systemReset.
+    // Hart-only reset; interconnect stays on systemReset. Board/top drives
+    // this from Rcc (same pulse as resetCtrl.softwareReset).
     val cpuSoftReset = False
     val cpuClockDomain = systemClockDomain.copy(
       reset = systemClockDomain.readResetWire || cpuSoftReset
