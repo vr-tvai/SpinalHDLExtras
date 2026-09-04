@@ -266,15 +266,29 @@ abstract class IPGenerator_[CFG : ClassTag] extends IPGenerator {
          |""".stripMargin
     Files.write(Paths.get(f"${report.globalData.config.targetDirectory}/${report.toplevelName}_top.sv"), top_file.getBytes)
 
+    val genDir = report.globalData.config.targetDirectory
+    val top = report.toplevelName
+    val verilog = s"$genDir/$top.v"
+    val sdc = s"$genDir/$top.sdc"
+
+    // Emit SDC before Yosys so we can fail early on empty/wrong CDC globs.
+    Constraints.write_file(report, sdc)
+    validateSdcAgainstRtl(top, verilog, sdc, label = "pre-yosys")
+
     // Yosys only when yosys_opt. Obfuscate is Spinal PhaseObfuscater alone —
     // do not flatten/opt here or CDC get_cells / through-net globs go empty.
     if (options.yosys_opt) {
       import scala.sys.process._
 
+      // Default write_verilog dumps leaves first / top last. IPK wrap starts
+      // `pragma protect` after the top ports, so top-last leaves CDC modules
+      // clear. Dump top then the rest via -selected and concat.
+      val yosysTopV = s"$genDir/$top.yosys_top.v"
+      val yosysRestV = s"$genDir/$top.yosys_rest.v"
       val yosys_in_file =
         s"""
-          |read_verilog ${report.globalData.config.targetDirectory}/${report.toplevelName}.v
-          |hierarchy -top ${report.toplevelName}
+          |read_verilog $verilog
+          |hierarchy -top $top
           |tribuf
           |proc
           |# Keep CDC anchors visible to SDC globs across opt.
@@ -284,14 +298,22 @@ abstract class IPGenerator_[CFG : ClassTag] extends IPGenerator {
           |wreduce
           |opt -full
           |check
-          |write_verilog -decimal ${report.globalData.config.targetDirectory}/${report.toplevelName}.v
+          |select -module $top
+          |write_verilog -decimal -selected $yosysTopV
+          |select -clear
+          |select * $top %d
+          |write_verilog -decimal -selected $yosysRestV
           |""".stripMargin
 
       val input = new ByteArrayInputStream(yosys_in_file.getBytes)
       (options.yosys_cmd #< input).!
 
+      IPGenerator.concatYosysTopFirst(yosysTopV, yosysRestV, verilog)
+      Files.deleteIfExists(Paths.get(yosysTopV))
+      Files.deleteIfExists(Paths.get(yosysRestV))
+
       if (config.rtlHeader != null) {
-        val f = f"${report.globalData.config.targetDirectory}/${report.toplevelName}.v"
+        val f = verilog
         val stringToPrepend = new ByteArrayInputStream((f"/***\n${config.rtlHeader}\n***/\n").getBytes)
         val existingFile = new FileInputStream(f)
         val combinedStream = new SequenceInputStream(stringToPrepend, existingFile)
@@ -305,33 +327,21 @@ abstract class IPGenerator_[CFG : ClassTag] extends IPGenerator {
 
     {
       import scala.sys.process._
-      val genDir = report.globalData.config.targetDirectory
-      val top = report.toplevelName
-      val verilog = s"$genDir/$top.v"
-      val sdc = s"$genDir/$top.sdc"
-      val python3 = if (Seq("sh", "-c", "command -v python3 >/dev/null").! == 0) "python3" else ""
-      val rewriteScript = Paths.get("..", "ip_packager", "scripts", "rewrite_sdc_for_yosys.py")
-      if (python3.nonEmpty && options.yosys_opt && Files.exists(rewriteScript)) {
+      val rewriteScript = IPGenerator.extrasScript("rewrite_sdc_for_yosys.py")
+      val python3 = IPGenerator.findPython3
+      if (python3.isDefined && options.yosys_opt && rewriteScript.isDefined) {
         Seq(
-          python3, rewriteScript.toString,
+          python3.get, rewriteScript.get.toString,
           "--top", top,
           "--verilog", verilog,
           "--sdc", sdc,
           "--in-place"
         ).!
       }
-      val validateScript = Paths.get("..", "ip_packager", "scripts", "validate_sdc_paths.py")
-      if (python3.nonEmpty && Files.exists(validateScript)) {
-        val exitCode = Seq(
-          python3, validateScript.toString,
-          "--top", top,
-          "--verilog", verilog,
-          "--sdc", sdc
-        ).!
-        if (exitCode != 0) {
-          sys.error(s"SDC constraints do not match generated Verilog for $top (see validate_sdc_paths.py)")
-        }
-      }
+      validateSdcAgainstRtl(
+        top, verilog, sdc,
+        label = if (options.yosys_opt) "post-yosys" else "post-gen"
+      )
     }
 
     if(simDut != null && options.generate_sim) {
@@ -340,6 +350,31 @@ abstract class IPGenerator_[CFG : ClassTag] extends IPGenerator {
         top.noIoPrefix()
         top
       })
+    }
+  }
+
+  /** Fail gen if SDC globs do not hit the Verilog (Synplify-style). */
+  private def validateSdcAgainstRtl(top: String, verilog: String, sdc: String, label: String): Unit = {
+    import scala.sys.process._
+    val validateScript = IPGenerator.extrasScript("validate_sdc_paths.py")
+    if (validateScript.isEmpty) {
+      SpinalWarning(s"skip SDC/RTL validate ($label): SpinalHDLExtras/scripts/validate_sdc_paths.py missing")
+      return
+    }
+    val python3 = IPGenerator.findPython3.getOrElse {
+      sys.error(
+        s"python3 required for SDC validate ($label); not on PATH or oss-cad-suite/py3bin"
+      )
+    }
+    val exitCode = Seq(
+      python3, validateScript.get.toString,
+      "--top", top,
+      "--verilog", verilog,
+      "--sdc", sdc,
+      "--label", label
+    ).!
+    if (exitCode != 0) {
+      sys.error(s"SDC constraints do not match generated Verilog for $top [$label] (see validate_sdc_paths.py)")
     }
   }
 
@@ -378,6 +413,61 @@ abstract class IPGenerator_[CFG : ClassTag] extends IPGenerator {
 
 object IPGenerator {
   val KnownGenerators = new mutable.HashMap[String, () => IPGenerator]
+
+  /**
+   * Concat Yosys `-selected` dumps with top module first. Strips the second
+   * file's leading `/* Generated by Yosys ... */` so the netlist has one banner.
+   */
+  def concatYosysTopFirst(topPath: String, restPath: String, outPath: String): Unit = {
+    val topText = new String(Files.readAllBytes(Paths.get(topPath)))
+    val restRaw = new String(Files.readAllBytes(Paths.get(restPath)))
+    val restText =
+      if (restRaw.startsWith("/*")) {
+        val end = restRaw.indexOf("*/")
+        if (end >= 0) restRaw.substring(end + 2).replaceFirst("^\\s+", "") else restRaw
+      } else restRaw
+    val out = topText.stripSuffix("\n") + "\n\n" + restText
+    Files.write(Paths.get(outPath), out.getBytes)
+  }
+
+  /**
+   * Host python3, or oss-cad-suite's py3bin (spinal-image PATH historically
+   * only added `bin/`, not `py3bin/`).
+   */
+  def findPython3: Option[String] = {
+    import scala.sys.process._
+    if (Seq("sh", "-c", "command -v python3 >/dev/null").! == 0) {
+      return Some("python3")
+    }
+    val home = sys.env.getOrElse("HOME", "/root")
+    Seq(
+      s"$home/oss-cad-suite/py3bin/python3",
+      "/root/oss-cad-suite/py3bin/python3"
+    ).find { p =>
+      val path = Paths.get(p)
+      Files.isRegularFile(path) && Files.isExecutable(path)
+    }
+  }
+
+  /**
+   * Locate a file under SpinalHDLExtras/scripts/. Gen runs from various cwds
+   * (Extras itself, tinyclunx33_internal/spinal, …).
+   */
+  def extrasScript(name: String): Option[java.nio.file.Path] = {
+    val cwd = Paths.get("").toAbsolutePath.normalize
+    val rel = Seq(
+      Paths.get("scripts", name),
+      Paths.get("SpinalHDLExtras", "scripts", name),
+      Paths.get("..", "SpinalHDLExtras", "scripts", name),
+      Paths.get("..", "..", "SpinalHDLExtras", "scripts", name),
+      Paths.get("..", "..", "..", "SpinalHDLExtras", "scripts", name)
+    )
+    val fromWalk = Iterator.iterate(cwd)(_.getParent).takeWhile(_ != null).take(10).flatMap { d =>
+      Seq(d.resolve(Paths.get("scripts", name)), d.resolve(Paths.get("SpinalHDLExtras", "scripts", name)))
+    }
+    (rel.map(_.toAbsolutePath.normalize) ++ fromWalk)
+      .find(p => Files.isRegularFile(p))
+  }
 
   def main(args: Array[String]): Unit = {
     if (args.length > 0) {

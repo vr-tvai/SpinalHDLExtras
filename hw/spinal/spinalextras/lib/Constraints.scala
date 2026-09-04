@@ -183,19 +183,10 @@ class Constraints {
       file.println(s"set_clock_groups -asynchronous -group [get_clocks {${spiClockName.get}}] -group [get_clocks {${pllGenNames.mkString(" ")}}]")
     }
 
-    // set_clock_uncertainty belongs on the board SDC (fpga_top_som /
-    // usb_accessory_board), not IP emit.
+    // set_clock_uncertainty and pad false_paths (led/uart/i2c) belong on the
+    // board SDC. IP emit of get_ports {led} etc. is applied at chip top by CPE
+    // and MT447's when the board does not promote that name.
 
-    for (n <- presentPorts("led", "uart_txd")) {
-      file.println(s"set_false_path -to [get_ports {$n}]")
-    }
-    for (n <- presentPorts("uart_rxd")) {
-      file.println(s"set_false_path -from [get_ports {$n}]")
-    }
-    for (n <- presentPorts("scl", "sda")) {
-      file.println(s"set_false_path -from [get_ports {$n}]")
-      file.println(s"set_false_path -to [get_ports {$n}]")
-    }
     if (hasPort("jtag_tck")) {
       for (n <- presentPorts("jtag_tdi", "jtag_tms")) {
         file.println(s"set_input_delay -clock [get_clocks {jtag_tck}] -max 10.0 [get_ports {$n}]")
@@ -255,10 +246,18 @@ class Constraints {
     // in those wrappers still get marked.
     val usedCdcGlobs = scala.collection.mutable.LinkedHashSet[String]()
     var hasFifoCcRam = false
+    var hasStreamCcPop = false
+    var hasFlowCcPop = false
     Constraints.walkCdcComponents(report.toplevel) {
       case c if Constraints.isCdcThroughLeaf(c) =>
+        // Names/KeepName already applied in PhaseCdcAnchor; refresh for SDC.
         Constraints.markCdcAnchor(c)
-        usedCdcGlobs += Constraints.cdcGlobFor(c)
+        usedCdcGlobs ++= Constraints.cdcGlobsForNamed(c)
+        c match {
+          case _: StreamCCByToggle[_] => hasStreamCcPop = true
+          case _: FlowCCByToggle[_] | _: FlowCCUnsafeByToggle[_] => hasFlowCcPop = true
+          case _ =>
+        }
       case c: StreamFifoCC[_] =>
         Constraints.markFifoRam(c)
         hasFifoCcRam = true
@@ -276,8 +275,14 @@ class Constraints {
       }
     }
     // StreamCCByToggle pop-side payload regs (push clk → pop m2sPipe).
-    if (usedCdcGlobs.contains("*cdc_*ccToggle*")) {
+    if (hasStreamCcPop) {
       for (g <- Constraints.streamCcPopDataCellGlobs) {
+        file.println(s"set_false_path -to [get_cells -hierarchical {$g}]")
+      }
+    }
+    // FlowCC* output m2sPipe payload (inputArea.data → flow_m2sPipe).
+    if (hasFlowCcPop) {
+      for (g <- Constraints.flowCcPopDataCellGlobs) {
         file.println(s"set_false_path -to [get_cells -hierarchical {$g}]")
       }
     }
@@ -290,8 +295,8 @@ class Constraints {
     }
 
     // USB23 HIP: AXI/LMMI inputs sampled inside (hold). INTERRUPT false-path
-    // lives in board soft_dphy.sdc (-hierarchical); IP emit becomes
-    // u_flir_uab/*/INTERRUPT and misses nested USB23_1.
+    // lives in the board Soft-DPHY SDC (-hierarchical); IP emit becomes
+    // <ip_inst>/*/INTERRUPT and misses nested USB23_1.
     if (report.toplevel.getAllIo.exists(_.getName().startsWith("usb23"))) {
       for (pin <- Constraints.usb23HoldPinGlobs) {
         file.println(s"set_false_path -hold -to [get_pins -hierarchical {$pin}]")
@@ -362,13 +367,25 @@ object Constraints {
     case _                     => false
   }
 
-  def cdcGlobFor(c: Component): String = c match {
-    case _: BufferCC[_]              => "*cdc_BufferCC*"
-    // Instance is cdc_<orig>_ccToggle, not cdc_StreamCC.
-    case _: StreamCCByToggle[_]      => "*cdc_*ccToggle*"
-    case _: FlowCCByToggle[_]        => "*cdc_*flowCC*"
-    case _: FlowCCUnsafeByToggle[_]  => "*cdc_*flowCC*"
-    case _                           => "*cdc_BufferCC*"
+  def cdcGlobFor(c: Component): String = cdcGlobsForNamed(c).head
+
+  /**
+   * Through-net globs from the post-[[markCdcAnchor]] instance name.
+   * Synplify get_nets is case-sensitive: `*cdc_*flowCC*` does not match
+   * `cdc_FlowCCUnsafeByToggle`. FlowCCByToggle under JTAG keeps a user
+   * `*_ccToggle` name — emit that glob instead of an empty FlowCC miss.
+   */
+  def cdcGlobsForNamed(c: Component): Seq[String] = {
+    val n = Option(c.getName()).getOrElse("")
+    c match {
+      case _: BufferCC[_] => Seq("*cdc_BufferCC*")
+      // Instance is cdc_<orig>_ccToggle, not cdc_StreamCC.
+      case _: StreamCCByToggle[_] => Seq("*cdc_*ccToggle*")
+      case _: FlowCCByToggle[_] | _: FlowCCUnsafeByToggle[_] =>
+        if (n.toLowerCase.contains("cctoggle")) Seq("*cdc_*ccToggle*")
+        else Seq("*cdc_*FlowCC*")
+      case _ => Seq("*cdc_BufferCC*")
+    }
   }
 
   def markCdcAnchor(c: Component): Unit = {
@@ -383,24 +400,41 @@ object Constraints {
     c.ram.setName("ram")
   }
 
-  // Spinal markCdcAnchor names: cdc_BufferCC / cdc_StreamCCByToggle / …
+  /**
+   * KeepName Stream/Flow CDC pipe payload regs so obfuscate does not rename
+   * them out from under the popArea_stream_rData and flow_m2sPipe get_cells
+   * TIGs. Stream.m2sPipe uses rData; Flow.m2sPipe(holdPayload) uses a Reg
+   * named m2sPipe via setCompositeName.
+   */
+  def markCrossClockPipeData(c: Component): Unit = {
+    c.dslBody.walkDeclarations {
+      case bt: BaseType =>
+        val n = bt.getName()
+        if (n != null && (n.contains("_rData") || n.contains("_m2sPipe"))) {
+          bt.addTag(Obfuscater.KeepName)
+        }
+      case _ =>
+    }
+  }
+
+  // Spinal markCdcAnchor names: cdc_BufferCC / cdc_FlowCC* / cdc_*_ccToggle.
   // Do not glob bare *cdc_* — that also hits Lattice Soft-DPHY lscc_csr_cdc_*
   // and CPE can segfault expanding the collection.
   val cdcNetGlobs = Seq(
     "*cdc_BufferCC*",
     "*cdc_*ccToggle*",
-    "*cdc_*flowCC*"
+    "*cdc_*FlowCC*"
   )
 
-  // USB23 HIP INTERRUPT async out: board soft_dphy.sdc only (keeps
+  // USB23 HIP INTERRUPT async out: board Soft-DPHY SDC only (keeps
   // -hierarchical). Do not emit from IP SDC — CPE scopes to
-  // u_flir_uab/*/INTERRUPT and misses nested USB23_1.
+  // <ip_inst>/*/INTERRUPT and misses nested USB23_1.
 
   // USB23 HIP input leaves (databook hold TIGs). Use leaf globs (*/PIN), not
-  // *USB23*/PIN: CPE scopes IP SDC under u_flir_uab/ and strips -hierarchical,
-  // so u_flir_uab/*USB23*/X… is empty (USB23 is nested). */X… becomes
-  // u_flir_uab/*/X… and expands to USB23_1.USB23_inst (and PLL LMMIWDATA).
-  // LMMIWDATA — not LiteX LMMIDATA.
+  // *USB23*/PIN: CPE scopes IP SDC under the IP instance and strips
+  // -hierarchical, so <ip_inst>/*USB23*/X… is empty (USB23 is nested).
+  // */X… becomes <ip_inst>/*/X… and expands to USB23_1.USB23_inst (and PLL
+  // LMMIWDATA). LMMIWDATA — not LiteX LMMIDATA.
   val usb23HoldPinGlobs = Seq(
     "*/XMAWREADY",
     "*/XMWREADY",
@@ -425,6 +459,11 @@ object Constraints {
   // StreamCCByToggle pop m2sPipe holds push-clock payload; -through on the
   // ccToggle nets misses paths that *end* at these regs (TWR 2026-09-03).
   val streamCcPopDataCellGlobs = Seq("*/popArea_stream_rData*")
+  // FlowCC* output m2sPipe (holdPayload Reg via setCompositeName →
+  // outputArea_flow_m2sPipe_*). Do not use */flow_m2sPipe*: Synplify wants
+  // the leaf to start right after /, so that glob never matches and the
+  // push→pop payload CDC stays timed (MT447).
+  val flowCcPopDataCellGlobs = Seq("*flow_m2sPipe*")
 
   def addAttributeIfNeeded(d : Component, n : String, v : String): Unit = {
     if (!d.getTagsOf[Attribute].exists(a => a.getName == n)) {
@@ -443,7 +482,13 @@ object Constraints {
 
   def keep_key_heirarchy(d : Component): Unit = {
     walkCdcComponents(d) {
-      case c if isCdcThroughLeaf(c) => markCdcAnchor(c)
+      case c if isCdcThroughLeaf(c) =>
+        markCdcAnchor(c)
+        c match {
+          case _: StreamCCByToggle[_] | _: FlowCCByToggle[_] | _: FlowCCUnsafeByToggle[_] =>
+            markCrossClockPipeData(c)
+          case _ =>
+        }
       case c: StreamFifoCC[_] => markFifoRam(c)
       case _ =>
     }

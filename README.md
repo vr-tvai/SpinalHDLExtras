@@ -167,6 +167,19 @@ helpers (`RegisterTools`), rate limiting (`RateLimitFlow`), a byte/bit slip enco
 math types (`Rational`, `Complex`), a maximal-length LFSR-based `RandomNumberGenerator`, and
 `Obfuscater` (renames/obfuscates a generated netlist's signal names).
 
+## Scripts (`scripts/`)
+
+Radiant / IPGen helpers used by `IPGenerator` and by design packagers (thin shims may remain
+in product trees):
+
+- **`validate_sdc_paths.py`** — SDC vs Verilog checks (including Synplify-style `get_cells` globs);
+  run pre- and post-yosys from `IPGenerator`.
+- **`rewrite_sdc_for_yosys.py`** — path rewrite after `yosys_opt`.
+- **`wrap_rtl_for_ipk.py`**, **`encrypt_rtl_leave_usb23.py`** — IPK wrap and Lattice encrypt with
+  USB23 HIP carve-out.
+- **`gen_ipk_tcl.py`**, **`gen_ip_docs.py`**, **`build_ipx_bundle.py`** — ippackc Tcl, intro HTML,
+  IPX bundle assembly.
+
 ## Tests & Examples
 
 - **`lib/tests`** — ScalaTest simulation testbenches for the components above (FIFOs, memory pools,
