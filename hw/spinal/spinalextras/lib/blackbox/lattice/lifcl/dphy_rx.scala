@@ -569,8 +569,9 @@ class dphy_rx(cfg : MIPIConfig,
 
     def crossClock(reg: RegInst, field: UInt, newClock: ClockDomain, init: Int): UInt = {
       val stream = Stream(cloneOf(field))
+      val sec = field.getWidth - 1 downto 0
       stream.valid := reg.hitDoWrite
-      stream.payload := field
+      stream.payload := busSlaveFactory.writeData(sec).asUInt.resized
       val toggledCC = stream.ccToggle(field.clockDomain, newClock)
       new ClockingArea(io.byte_clock_domain()) {
         toggledCC.ready := RegNext(toggledCC.valid)
@@ -645,14 +646,20 @@ class dphy_rx(cfg : MIPIConfig,
     val byteCd = io.byte_clock_domain()
     new ClockingArea(byteCd) {
       def rise(sig: Bool): Bool = sig.rise(False)
+      /** HIP contention-detect has no launching clock; KeepName for SDC TIG. */
+      def hipCdRise(sig: Bool, name: String): Bool = {
+        val prev = RegNext(sig) init False
+        Constraints.markDphyHipStatus(prev, name)
+        sig && !prev
+      }
 
       p.hs_sync_rise := rise(io.hs_sync_o)
       if (io.misc_signals != null) {
         p.term_clk_en_rise := rise(io.misc_signals.term_clk_en_o)
         p.term_d_en_o0 := rise(io.misc_signals.term_d_en_o(0))
         p.hs_d_en_o := rise(io.misc_signals.hs_d_en_o)
-        p.cd_clk_o := rise(io.misc_signals.cd_clk_o)
-        p.cd_d0_o := rise(io.misc_signals.cd_d0_o)
+        p.cd_clk_o := hipCdRise(io.misc_signals.cd_clk_o, "cdc_dphy_cd_clk")
+        p.cd_d0_o := hipCdRise(io.misc_signals.cd_d0_o, "cdc_dphy_cd_d0")
       } else {
         p.term_clk_en_rise := False
         p.term_d_en_o0 := False
