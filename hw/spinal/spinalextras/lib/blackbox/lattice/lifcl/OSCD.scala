@@ -30,6 +30,10 @@ object OSCDConfig {
   def create(hf: ClockSpecification = misc.ClockSpecification(0 MHz), hf_sed : ClockSpecification = misc.ClockSpecification(0 MHz)): OSCDConfig = {
     new OSCDConfig(HF_DIV = OSCAConfig.find_div(hf), HF_SED_SEC_DIV = OSCAConfig.find_div(hf_sed))
   }
+
+  /** CONFIG_LMMI only needs HF_SED → SEDC_CLK; LF is unused in fabric. */
+  def forConfigLmmi(hf_sed: ClockSpecification): OSCDConfig =
+    new OSCDConfig(LF_OUTPUT_EN = false, HF_DIV = None, HF_SED_SEC_DIV = OSCAConfig.find_div(hf_sed))
 }
 
 class OSCD(cfg: OSCDConfig) extends BlackBox {

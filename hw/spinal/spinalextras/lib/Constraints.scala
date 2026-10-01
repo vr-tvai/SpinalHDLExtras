@@ -29,6 +29,7 @@ class Constraints {
   val min_delay = new ArrayBuffer[(Seq[Data], TimeNumber)]()
 
   var false_path_all_clocks = false
+  var hasDphyHipStatus = false
   val verbatim_constraints = new ArrayBuffer[() => String]()
 
   def SetFalsePathAllClocks(): Unit = {
@@ -100,12 +101,40 @@ class Constraints {
     }
   }
 
+  /** Lattice HIP/blackbox outputs (OSCD HFSDCOUT, DCS DCSOUT, …) are wires
+    * ``inst_PIN`` in Verilog; CPE cannot ``get_pins`` the blackbox leaf and
+    * an empty ``create_clock`` collection segfaults. */
+  private def isBlackBoxIo(data: Data): Boolean =
+    data.component.isInstanceOf[BlackBox]
+
+  private def blackBoxClockNet(data: Data): String = {
+    val parts = data.getRtlPath().split('/')
+    if (parts.length >= 2) {
+      s"[get_nets -hierarchical {*${parts.head}_${parts.last}}]"
+    } else {
+      s"[get_nets -hierarchical {*${portLeaf(data)}*}]"
+    }
+  }
+
   private def hierarchicalClockTarget(data: Data, toplevel: Component): String = {
     val leaf = portLeaf(data)
     if (isToplevelPort(data, toplevel)) {
       s"[get_ports {${leaf}}]"
     } else if (isSoftDphyByteClock(leaf)) {
-      s"[get_pins -hierarchical {*/${leaf}}]"
+      // Two CSI pipes share leaf clk_byte_hs_o; */clk_byte_hs_o matches both
+      // and duplicate create_clock on the same pins segfaults CPE.
+      val parts = data.getRtlPath().split('/')
+      if (parts.length >= 2) {
+        s"[get_nets -hierarchical {*${parts.head}_${parts.last}}]"
+      } else {
+        s"[get_pins -hierarchical {*/${leaf}}]"
+      }
+    } else if (data.hasTag(Constraints.FabricToggleClock)) {
+      // CPU/2 fabric toggle (lmmiClk). Reset-sync AND is lmmiClk_4; get_pins
+      // {*/_zz_LMMI_CLK} missed it. KeepName + get_nets glob survives obfuscate.
+      s"[get_nets -hierarchical {*${leaf}*}]"
+    } else if (isBlackBoxIo(data)) {
+      blackBoxClockNet(data)
     } else {
       s"[get_pins -hierarchical {*/${data.getRtlPath()}}]"
     }
@@ -129,7 +158,7 @@ class Constraints {
     leaf == "clk_byte_hs_o" || leaf == "clk_byte_o"
   }
 
-  def write_file[T <: Component](report: SpinalReport[T], path : String): Unit = {
+  def write_file[T <: Component](report: SpinalReport[T], path : String, emitPadConstraints: Boolean = true): Unit = {
     val file = new PrintWriter(path)
 
     report.globalData.config.defaultClockDomainFrequency match {
@@ -144,6 +173,8 @@ class Constraints {
 
     def hasPort(n: String) = report.toplevel.getAllIo.exists(_.getName() == n)
     def presentPorts(ns: String*) = ns.filter(hasPort)
+    def isSpiPadGeneratedDest(dest: Data): Boolean =
+      hasPort("spiflash_clk") && !isPllGeneratedDest(dest) && !isSoftDphyByteClock(portLeaf(dest))
 
     for ((data, freq) <- clocks) {
       if (generated_clocks.exists(_._1 == data)) {
@@ -157,75 +188,88 @@ class Constraints {
       }
     }
 
-    for ((dest, source, mul, div) <- generated_clocks) {
+    // HIP-only: CONFIG_CLKRST_CORE.LMMI_CLK_O → CONFIG_LMMIA.LMMICLK.
+    // Fabric must not clock SLICE from CLK_O (map DRC 71003036). Same edge as
+    // lmmiClk; defining it stops "clock nets without definition".
+    if (clocks.exists { case (d, _) => d.hasTag(Constraints.FabricToggleClock) }) {
+      file.println("# CONFIG_CLKRST_CORE.LMMI_CLK_O HIP-only (DRC 71003036)")
+      file.println("create_generated_clock -name {CONFIG_LMMI_CLK_O} -source [get_nets -hierarchical {*lmmiClk*}] -multiply_by 1 -divide_by 1 [get_nets -hierarchical {*LMMI_CLK_O}]")
+    }
+
+    for ((dest, source, mul, div) <- generated_clocks if emitPadConstraints || !isSpiPadGeneratedDest(dest)) {
       val cname =
-        if (hasPort("spiflash_clk") && !isPllGeneratedDest(dest) && !isSoftDphyByteClock(portLeaf(dest)))
+        if (isSpiPadGeneratedDest(dest))
           "spiflash_clk"
         else
           clockNameFor(dest, report.toplevel)
       file.println(s"create_generated_clock -name {${cname}} -source ${generatedClockSource(dest, source, report.toplevel)} -multiply_by ${mul} -divide_by ${div} ${generatedClockDest(dest, report.toplevel)}")
     }
 
-    if (hasPort("jtag_tck")) {
-      file.println("create_clock -name {jtag_tck} -period 100 [get_ports {jtag_tck}]")
-    }
-
-    val spiGenNames = generated_clocks
-      .filterNot { case (dest, _, _, _) => isPllGeneratedDest(dest) }
-      .map { case (dest, _, _, _) =>
-        if (hasPort("spiflash_clk")) "spiflash_clk" else clockNameFor(dest, report.toplevel)
+    if (emitPadConstraints) {
+      if (hasPort("jtag_tck")) {
+        file.println("create_clock -name {jtag_tck} -period 100 [get_ports {jtag_tck}]")
       }
-    val pllGenNames = generated_clocks
-      .filter { case (dest, _, _, _) => isPllGeneratedDest(dest) }
-      .map { case (dest, _, _, _) => clockNameFor(dest, report.toplevel) }
-    val spiClockName = spiGenNames.headOption.orElse(
-      if (hasPort("spiflash_clk")) Some("spiflash_clk") else None
-    )
-    if (spiClockName.nonEmpty && pllGenNames.nonEmpty) {
-      file.println(s"set_clock_groups -asynchronous -group [get_clocks {${spiClockName.get}}] -group [get_clocks {${pllGenNames.mkString(" ")}}]")
-    }
 
-    // set_clock_uncertainty and pad false_paths (led/uart/i2c) belong on the
-    // board SDC. IP emit of get_ports {led} etc. is applied at chip top by CPE
-    // and MT447's when the board does not promote that name.
+      val spiGenNames = generated_clocks
+        .filterNot { case (dest, _, _, _) => isPllGeneratedDest(dest) }
+        .map { case (dest, _, _, _) =>
+          if (hasPort("spiflash_clk")) "spiflash_clk" else clockNameFor(dest, report.toplevel)
+        }
+      val pllGenNames = generated_clocks
+        .filter { case (dest, _, _, _) => isPllGeneratedDest(dest) }
+        .map { case (dest, _, _, _) => clockNameFor(dest, report.toplevel) }
+      val spiClockName = spiGenNames.headOption.orElse(
+        if (hasPort("spiflash_clk")) Some("spiflash_clk") else None
+      )
+      if (spiClockName.nonEmpty && pllGenNames.nonEmpty) {
+        file.println(s"set_clock_groups -asynchronous -group [get_clocks {${spiClockName.get}}] -group [get_clocks {${pllGenNames.mkString(" ")}}]")
+      }
 
-    if (hasPort("jtag_tck")) {
-      for (n <- presentPorts("jtag_tdi", "jtag_tms")) {
-        file.println(s"set_input_delay -clock [get_clocks {jtag_tck}] -max 10.0 [get_ports {$n}]")
-        file.println(s"set_input_delay -clock [get_clocks {jtag_tck}] -min 2.0 [get_ports {$n}]")
+      // set_clock_uncertainty and pad false_paths (led/uart/i2c) belong on the
+      // board SDC. IP emit of get_ports {led} etc. is applied at chip top by CPE
+      // and MT447's when the board does not promote that name.
+
+      if (hasPort("jtag_tck")) {
+        for (n <- presentPorts("jtag_tdi", "jtag_tms")) {
+          file.println(s"set_input_delay -clock [get_clocks {jtag_tck}] -max 10.0 [get_ports {$n}]")
+          file.println(s"set_input_delay -clock [get_clocks {jtag_tck}] -min 2.0 [get_ports {$n}]")
+        }
+        if (hasPort("jtag_tdo")) {
+          file.println("set_output_delay -clock [get_clocks {jtag_tck}] -max 10.0 [get_ports {jtag_tdo}]")
+          file.println("set_output_delay -clock [get_clocks {jtag_tck}] -min 2.0 [get_ports {jtag_tdo}]")
+        }
       }
-      if (hasPort("jtag_tdo")) {
-        file.println("set_output_delay -clock [get_clocks {jtag_tck}] -max 10.0 [get_ports {jtag_tdo}]")
-        file.println("set_output_delay -clock [get_clocks {jtag_tck}] -min 2.0 [get_ports {jtag_tdo}]")
+      // Pad I/O delays belong on the board SDC. Emit them from the IP only when
+      // the generated SCK is still the `spiflash_clk` port (unobfuscated top).
+      if (spiClockName.contains("spiflash_clk") && hasPort("spiflash_dq")) {
+        file.println("set_input_delay -clock [get_clocks {spiflash_clk}] -clock_fall -max 6.0 [get_ports {spiflash_dq*}]")
+        file.println("set_input_delay -clock [get_clocks {spiflash_clk}] -clock_fall -min 1.5 [get_ports {spiflash_dq*}]")
+        file.println("set_output_delay -clock [get_clocks {spiflash_clk}] -max 2.0 [get_ports {spiflash_dq*}]")
+        file.println("set_output_delay -clock [get_clocks {spiflash_clk}] -min -3.0 [get_ports {spiflash_dq*}]")
       }
+      if (spiClockName.contains("spiflash_clk") && hasPort("spiflash_cs_n")) {
+        file.println("set_output_delay -clock [get_clocks {spiflash_clk}] -max 5.0 [get_ports {spiflash_cs_n}]")
+        file.println("set_output_delay -clock [get_clocks {spiflash_clk}] -min -3.0 [get_ports {spiflash_cs_n}]")
+      }
+    } else if (hasPort("jtag_tck") || hasPort("spiflash_clk")) {
+      file.println("# jtag_tck / spiflash_clk pad constraints: board SDC")
     }
-    // Pad I/O delays belong on the board SDC. Emit them from the IP only when
-    // the generated SCK is still the `spiflash_clk` port (unobfuscated top).
-    if (spiClockName.contains("spiflash_clk") && hasPort("spiflash_dq")) {
-      file.println("set_input_delay -clock [get_clocks {spiflash_clk}] -clock_fall -max 6.0 [get_ports {spiflash_dq*}]")
-      file.println("set_input_delay -clock [get_clocks {spiflash_clk}] -clock_fall -min 1.5 [get_ports {spiflash_dq*}]")
-      file.println("set_output_delay -clock [get_clocks {spiflash_clk}] -max 2.0 [get_ports {spiflash_dq*}]")
-      file.println("set_output_delay -clock [get_clocks {spiflash_clk}] -min -3.0 [get_ports {spiflash_dq*}]")
-    }
-    if (spiClockName.contains("spiflash_clk") && hasPort("spiflash_cs_n")) {
-      file.println("set_output_delay -clock [get_clocks {spiflash_clk}] -max 5.0 [get_ports {spiflash_cs_n}]")
-      file.println("set_output_delay -clock [get_clocks {spiflash_clk}] -min -3.0 [get_ports {spiflash_cs_n}]")
-    }
-    // Do not emit Spinal-hierarchy leftovers (cpol/cpha, brightness_ret,
-    // mipi_to_bytes_cd_d0_o_regNext). Those names die at obfuscate/flatten;
-    // pad false_paths and CDC globs cover the same intent.
+    // Do not emit Spinal-hierarchy leftovers (cpol/cpha, brightness_ret).
+    // Soft-DPHY HIP cd_* uses KeepName cdc_dphy_cd_* (see dphyHipStatusCellGlobs).
 
     //    for ((clks, async) <- clock_groups) {
     //      file.println(s"set_clock_groups ${clks.map("-group [get_clocks {" + _.name +"}]").mkString(" ")} ${if(async) "-asynchronous" else ""}")
     //    }
 
-    if (hasPort("jtag_tck") && presentPorts("jtag_tdi", "jtag_tms").size == 2) {
-      // Radiant set_max_skew accepts nets, not get_ports. Omit jtag_tdo*:
-      // at IP CPE scope that glob is empty and 1026001 (CPE then segfaults).
-      file.println("set_max_skew [get_nets {jtag_tck* jtag_tdi* jtag_tms*}] 10.0")
-    }
-    if (hasPort("spiflash_clk") && hasPort("spiflash_cs_n") && hasPort("spiflash_dq")) {
-      file.println("set_max_skew [get_nets {spiflash_clk* spiflash_cs_n* spiflash_dq*}] 1.0")
+    if (emitPadConstraints) {
+      if (hasPort("jtag_tck") && presentPorts("jtag_tdi", "jtag_tms").size == 2) {
+        // Radiant set_max_skew accepts nets, not get_ports. Omit jtag_tdo*:
+        // at IP CPE scope that glob is empty and 1026001 (CPE then segfaults).
+        file.println("set_max_skew [get_nets {jtag_tck* jtag_tdi* jtag_tms*}] 10.0")
+      }
+      if (hasPort("spiflash_clk") && hasPort("spiflash_cs_n") && hasPort("spiflash_dq")) {
+        file.println("set_max_skew [get_nets {spiflash_clk* spiflash_cs_n* spiflash_dq*}] 1.0")
+      }
     }
 
     for ((datas, delay) <- min_delay) {
@@ -295,6 +339,14 @@ class Constraints {
         file.println(s"set_false_path -to [get_cells -hierarchical {$g}]")
       }
     }
+    // Soft-DPHY HIP cd_* (contention-detect) sampled in byte clock: no
+    // launching clock on the HIP pin. KeepName cdc_dphy_cd_* survives obfuscate.
+    // Do not glob *cdc_* — that hits Lattice lscc_csr_cdc_* (CPE 1026001).
+    if (hasDphyHipStatus) {
+      for (g <- Constraints.dphyHipStatusCellGlobs) {
+        file.println(s"set_false_path -to [get_cells -hierarchical {$g}]")
+      }
+    }
 
     // USB23 HIP: AXI/LMMI inputs sampled inside (hold). INTERRUPT false-path
     // lives in the board Soft-DPHY SDC (-hierarchical); IP emit becomes
@@ -328,6 +380,9 @@ object Constraints {
 
   /** Same net as top `jtag_tck`. write_file already create_clocks the pad. */
   object JtagPadClock extends SpinalTag
+
+  /** CPU/2 fabric toggle (CONFIG_LMMI `lmmiClk`). SDC uses get_nets glob. */
+  object FabricToggleClock extends SpinalTag
 
   private def withCdcPrefix(n: String): String =
     if (n.contains("cdc_")) n else s"cdc_$n"
@@ -409,10 +464,27 @@ object Constraints {
     c.setName(stableCdcName(c))
   }
 
-  /** Keep StreamFifoCC Mem name `ram` so ram_spinal_port1 survives obfuscate. */
+  /** Keep StreamFifoCC Mem name `ram` so ram_spinal_port1 survives obfuscate.
+    * Dual-clock inferred Mem without syn_ramstyle maps to LUT RAM on LIFCL
+    * (256×65 pixel CDC is ~2.4k LUT4/cam). Force EBR.
+    * Synplify FX480: block_ram alone is not enough — write-thru / CDC
+    * coding style needs no_rw_check (same pair as DepCmdWindow1 epIssueMem).
+    */
   def markFifoRam(c: StreamFifoCC[_]): Unit = {
     c.ram.addTag(Obfuscater.KeepName)
     c.ram.setName("ram")
+    c.ram.addAttribute("syn_ramstyle", "block_ram,no_rw_check")
+    c.ram.addAttribute("ramstyle", "no_rw_check")
+    c.ram.addAttribute("ram_style", "block")
+  }
+
+  /** KeepName Soft-DPHY HIP `cd_*` sample flop so SDC glob survives obfuscate. */
+  def markDphyHipStatus(prev: Bool, name: String): Unit = {
+    check()
+    prev.setName(name)
+    prev.addTag(Obfuscater.KeepName)
+    KeepAttribute(prev)
+    constraints.hasDphyHipStatus = true
   }
 
   /**
@@ -479,6 +551,9 @@ object Constraints {
   // the leaf to start right after /, so that glob never matches and the
   // push→pop payload CDC stays timed (MT447).
   val flowCcPopDataCellGlobs = Seq("*flow_m2sPipe*")
+  // Soft-DPHY HIP contention-detect (`cd_clk_o` / `cd_d0_o`) sampled in byte
+  // clock. Tight glob: do not use *cdc_* (hits lscc_csr_cdc_*).
+  val dphyHipStatusCellGlobs = Seq("*cdc_dphy_cd_*")
 
   def addAttributeIfNeeded(d : Component, n : String, v : String): Unit = {
     if (!d.getTagsOf[Attribute].exists(a => a.getName == n)) {
@@ -555,9 +630,9 @@ object Constraints {
     }
   }
 
-  def write_file[T <: Component](report: SpinalReport[T], path : String): Unit = {
+  def write_file[T <: Component](report: SpinalReport[T], path : String, emitPadConstraints: Boolean = true): Unit = {
     check()
-    constraints.write_file(report, path)
+    constraints.write_file(report, path, emitPadConstraints)
   }
   def add_verbatim(s: => String) : Unit = {
     check()

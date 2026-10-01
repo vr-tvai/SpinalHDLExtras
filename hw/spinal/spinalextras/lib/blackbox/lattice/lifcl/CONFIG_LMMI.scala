@@ -4,7 +4,8 @@ import spinal.core._
 import spinal.lib._
 import spinal.lib.bus.misc.AddressMapping
 import spinalextras.lib.bus.{LMMI, WishboneGlobalBus}
-import spinalextras.lib.misc.ClockSpecification
+import spinalextras.lib.Constraints
+import spinalextras.lib.misc.{ClockSpecification, Obfuscater}
 import spinalextras.lib.soc.{DeviceTree, DeviceTreeProvider, Rcc}
 
 import scala.language.postfixOps
@@ -217,11 +218,14 @@ object CONFIG_LMMI {
    * reset then ISC_ENABLE_X / ISC_DISABLE / LSC_REFRESH.
    */
   def attach_bus(bus: WishboneGlobalBus, mapping: AddressMapping, rcc: Rcc): Unit = {
-    val osc = OSCD(OSCDConfig.create(hf_sed = lmmiClkSpec))
+    val osc = OSCD(OSCDConfig.forConfigLmmi(lmmiClkSpec))
     val lmmiClk = RegInit(False)
+    lmmiClk.setName("lmmiClk")
+    lmmiClk.addTag(Obfuscater.KeepName)
+    lmmiClk.addTag(Constraints.FabricToggleClock)
     lmmiClk := !lmmiClk
     KeepAttribute(lmmiClk)
-    spinalextras.lib.Constraints.create_clock(lmmiClk, ClockDomain.current.frequency.getValue / 2)
+    Constraints.create_clock(lmmiClk, ClockDomain.current.frequency.getValue / 2)
 
     /* TN-02099: READY stays low until LMMIRESETN toggles. POR hold must not
      * start the refresh writer (that would loop-reconfigure). */

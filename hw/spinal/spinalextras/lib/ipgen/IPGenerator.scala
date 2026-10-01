@@ -25,6 +25,11 @@ import scala.reflect.{ClassTag, classTag}
 
 case class IPGeneratorOptions(device: Device = Device(vendor = "lattice", family = "lifcl"),
                               obfuscate: Boolean = false,
+                              /** JTAG / SPI pad create_clock, I/O delay, skew, and spiflash_clk
+                                * generated-clock lines. Default false: nested Soft-IP (flir_uab under
+                                * usb_accessory_board) — board SDC owns those pads at chip top.
+                                */
+                              padConstraints: Boolean = false,
                               schema_name: String = "",
                               instance_name: String = "",
                               output_dir: String = "hw/gen",
@@ -272,7 +277,7 @@ abstract class IPGenerator_[CFG : ClassTag] extends IPGenerator {
     val sdc = s"$genDir/$top.sdc"
 
     // Emit SDC before Yosys so we can fail early on empty/wrong CDC globs.
-    Constraints.write_file(report, sdc)
+    Constraints.write_file(report, sdc, options.padConstraints)
     validateSdcAgainstRtl(top, verilog, sdc, label = "pre-yosys")
 
     // Yosys only when yosys_opt. Obfuscate is Spinal PhaseObfuscater alone —
@@ -323,7 +328,7 @@ abstract class IPGenerator_[CFG : ClassTag] extends IPGenerator {
       }
     }
 
-    Spinex.generate_ipx(report, obfuscate = options.obfuscate)
+    Spinex.generate_ipx(report, obfuscate = options.obfuscate, padConstraints = options.padConstraints)
 
     {
       import scala.sys.process._

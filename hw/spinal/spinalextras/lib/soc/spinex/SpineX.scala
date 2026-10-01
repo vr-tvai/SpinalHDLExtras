@@ -459,7 +459,7 @@ case class Spinex(config : SpinexConfig = SpinexConfig.default) extends Componen
 
 
 object Spinex{
-  def generate_ipx[T <: Component](report : SpinalReport[T], obfuscate: Boolean = false): Unit = {
+  def generate_ipx[T <: Component](report : SpinalReport[T], obfuscate: Boolean = false, padConstraints: Boolean = true): Unit = {
     val rtl_sourcess = Seq(
       "/blackbox/lattice/lifcl/BlackboxMemory.sv",
       "/opencores_i2c/rtl/verilog/i2c_master_bit_ctrl.v",
@@ -481,7 +481,7 @@ object Spinex{
 
     tmpFiles.foreach(_.toFile.deleteOnExit())
 
-    IPX.generate_ipx(report)
+    IPX.generate_ipx(report, padConstraints)
     DeviceTree.generate(report)
     DiagramNet.generate(report, obfuscate)
   }

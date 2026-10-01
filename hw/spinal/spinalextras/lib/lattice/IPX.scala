@@ -2,19 +2,18 @@ package spinalextras.lib.lattice
 import scala.io.Source
 import spinal.core._
 import spinalextras.lib.Constraints
-import spinalextras.lib.soc.spinex.plugins.IdentificationPlugin
 
 import java.io.{File, PrintWriter}
 import java.util.Calendar
 
 object IPX {
-  def generate_ipx[T <: Component](report : SpinalReport[T]): Unit = {
+  def generate_ipx[T <: Component](report : SpinalReport[T], padConstraints: Boolean = true): Unit = {
 
     val file = new PrintWriter(s"${report.globalData.config.targetDirectory}/${report.toplevelName}.ipx")
 
     file.write(
       s"""<?xml version="1.0" ?>
-        |<RadiantModule generator="ipgen" module="${report.toplevel.definitionName}" name="${report.toplevelName}" source_format="Verilog" version="${IdentificationPlugin.getGitVersion()}" date="${Calendar.getInstance().getTime}">
+        |<RadiantModule generator="ipgen" module="${report.toplevel.definitionName}" name="${report.toplevelName}" source_format="Verilog" date="${Calendar.getInstance().getTime}">
         | <Package>
         |""".stripMargin)
 
@@ -31,7 +30,7 @@ object IPX {
     }
 
     val sdc_file = s"${report.toplevelName}.sdc"
-    Constraints.write_file(report, s"${report.globalData.config.targetDirectory}/${sdc_file}")
+    Constraints.write_file(report, s"${report.globalData.config.targetDirectory}/${sdc_file}", padConstraints)
 
     file.write(
       s"""
