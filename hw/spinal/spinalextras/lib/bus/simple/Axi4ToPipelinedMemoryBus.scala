@@ -6,6 +6,7 @@ import spinal.core.sim.{SimBaseTypePimper, SimBoolPimper, SimClockDomainHandlePi
 import spinal.lib._
 import spinal.lib.bus.amba4.axi.Axi4.resp.OKAY
 import spinal.lib.bus.amba4.axi.{Axi4, Axi4Config, Axi4R, Axi4W}
+import spinal.lib.bus.misc.SizeMapping
 import spinal.lib.bus.simple.{PipelinedMemoryBus, PipelinedMemoryBusConfig}
 import spinal.lib.fsm._
 import spinalextras.lib.formal.fillins.Axi4Formal.Axi4FormalExt
@@ -29,7 +30,9 @@ case class Axi4ToPipelinedMemoryBusConfig(
                                            readResponseFifoDepth: Int = 4, // Sensible default, can be configured
                                            readResponseFifoLatency: Int = 2,
                                            readResponseFifoForFMax: Boolean = false,
-                                           sentinelResp: Boolean = true
+                                           sentinelResp: Boolean = true,
+                                           /** HIP event DMA: AND WSTRB to one 32-bit lane when AWADDR (low 16) hits. */
+                                           eventSlotStrobe: Option[SizeMapping] = None
                                          ) {
   val pmbConfig = PipelinedMemoryBusConfig(axiConfig.addressWidth, axiConfig.dataWidth)
 }
@@ -90,6 +93,14 @@ class Axi4ToPipelinedMemoryBus(config: Axi4ToPipelinedMemoryBusConfig) extends C
       write.address := current_write_addr
       write.data := axi_w.data
       write.mask := axi_w.strb
+      if (config.eventSlotStrobe.nonEmpty) {
+        val ring = config.eventSlotStrobe.get
+        val off = current_write_addr.resize(16 bits)
+        val slot = Mux(current_write_addr(2), B(0xF0, 8 bits), B(0x0F, 8 bits))
+        when(ring.hit(off)) {
+          write.mask := axi_w.strb & slot
+        }
+      }
       write.write := True
       write
     }) <> io.pmb.cmd
@@ -244,9 +255,33 @@ class Axi4ToPipelinedMemoryBus(config: Axi4ToPipelinedMemoryBusConfig) extends C
     }
   }
 
-  override def covers(): Seq[FormalProperty] = Seq(io.axi.r.last && io.axi.r.fire)
+  override def covers(): Seq[FormalProperty] = Seq(
+    io.axi.r.last && io.axi.r.fire,
+    io.axi.w.last && io.axi.w.fire,
+    write_area.writeMode && io.axi.w.valid && !io.axi.w.ready
+  )
 
   override def formalComponentProperties() = new FormalProperties {
+    val prevPmbWriteAddr = Reg(cloneOf(io.pmb.cmd.address)) init (0)
+    val hadPmbWrite = RegInit(False)
+    when(!write_area.writeMode) {
+      hadPmbWrite := False
+    } elsewhen (io.pmb.cmd.fire && io.pmb.cmd.write) {
+      when(hadPmbWrite) {
+        addFormalProperty(io.pmb.cmd.address === prevPmbWriteAddr + addr_increment,
+          "INCR write PMB addresses must advance by AxSIZE (no skip / no stall)")
+      }
+      addFormalProperty(io.pmb.cmd.address === write_area.current_write_addr,
+        "PMB write address is the bridge beat address")
+      prevPmbWriteAddr := io.pmb.cmd.address
+      hadPmbWrite := True
+    }
+
+    when(write_area.writeMode) {
+      addFormalProperty(addr_increment === get_addr_increment(write_area.aw_reg.size),
+        "Write increment tracks captured AWSIZE")
+    }
+
     addFormalProperty(io.pmb.contract.outstandingReads +^ read_area.pmb_rsp_fifo.io.occupancy === read_area.inFlightCounter, "Flight counter should account for outstanding reads and items in the fifo")
 
     addFormalProperty((read_area.rspCount +^ read_area.inFlightCounter.value) === read_area.read_pmb_cmds_sent, "In flight + rsp inc should equal pmb sents")
@@ -415,6 +450,91 @@ class Axi4ToPipelinedMemoryBusTester extends AnyFunSuite {
 
       dut.clockDomain.waitSampling(1000)
     }
+  }
+
+  test("event-slot-strb") {
+    val axiConfig = Axi4Config(
+      addressWidth = 16,
+      dataWidth = 64,
+      idWidth = 4,
+      useStrb = true,
+      useLen = true,
+      useBurst = true
+    )
+    class EventSlotTb(narrow: Boolean) extends Component {
+      val io = new Bundle {
+        val axi = slave(Axi4(axiConfig))
+      }
+      val mem = Memories(MemoryRequirement(Bits(64 bits), num_elements = 256,
+        numReadWritePorts = 1, numReadPorts = 0, numWritePorts = 0, needsMask = true))
+      val axi2pmb = Axi4ToPipelinedMemoryBus(Axi4ToPipelinedMemoryBusConfig(
+        axiConfig,
+        readResponseFifoDepth = 4,
+        readResponseFifoLatency = 0,
+        eventSlotStrobe = if (narrow) Some(SizeMapping(0x140L, 0x40L)) else None
+      ))
+      axi2pmb.io.pmb >> mem.pmbs().head
+      axi2pmb.io.axi <> io.axi
+    }
+
+    def axiWrite(dut: EventSlotTb, addr: Int, data: BigInt, strb: Int): Unit = {
+      dut.io.axi.aw.valid #= true
+      dut.io.axi.aw.addr #= addr
+      dut.io.axi.aw.len #= 0
+      dut.io.axi.aw.size #= 3
+      dut.io.axi.aw.burst #= 1
+      dut.clockDomain.waitSamplingWhere(dut.io.axi.aw.ready.toBoolean)
+      dut.io.axi.aw.valid #= false
+      dut.io.axi.w.valid #= true
+      dut.io.axi.w.data #= data
+      dut.io.axi.w.strb #= strb
+      dut.io.axi.w.last #= true
+      dut.clockDomain.waitSamplingWhere(dut.io.axi.w.ready.toBoolean)
+      dut.io.axi.w.valid #= false
+      dut.io.axi.b.ready #= true
+      dut.clockDomain.waitSamplingWhere(dut.io.axi.b.valid.toBoolean)
+      dut.io.axi.b.ready #= false
+    }
+
+    def axiRead8(dut: EventSlotTb, addr: Int): BigInt = {
+      dut.io.axi.ar.valid #= true
+      dut.io.axi.ar.addr #= addr
+      dut.io.axi.ar.len #= 0
+      dut.io.axi.ar.size #= 3
+      dut.io.axi.ar.burst #= 1
+      dut.clockDomain.waitSamplingWhere(dut.io.axi.ar.ready.toBoolean)
+      dut.io.axi.ar.valid #= false
+      dut.io.axi.r.ready #= true
+      dut.clockDomain.waitSamplingWhere(dut.io.axi.r.valid.toBoolean)
+      val d = dut.io.axi.r.data.toBigInt
+      dut.io.axi.r.ready #= false
+      d
+    }
+
+    def runPair(narrow: Boolean, strb0: Int, strb1: Int, expectLo: BigInt, expectHi: BigInt, label: String): Unit = {
+      Config.sim.workspaceName(s"Axi4ToPmb_eventSlot_$label").doSim(new EventSlotTb(narrow)) { dut =>
+        SimTimeout(100 us)
+        dut.clockDomain.forkStimulus(100 MHz)
+        Seq(dut.io.axi.aw, dut.io.axi.ar, dut.io.axi.w).foreach(_.valid #= false)
+        Seq(dut.io.axi.r, dut.io.axi.b).foreach(_.ready #= false)
+        dut.clockDomain.waitSampling(4)
+        axiWrite(dut, 0x140, BigInt("00000000A5A5A5A5", 16), strb0)
+        axiWrite(dut, 0x144, BigInt("5A5A5A5A00000000", 16), strb1)
+        val got = axiRead8(dut, 0x140)
+        val lo = got & BigInt("FFFFFFFF", 16)
+        val hi = got >> 32
+        if (lo != expectLo)
+          fail(s"$label lo=0x${lo.toString(16)} want ${expectLo.toString(16)}")
+        if (hi != expectHi)
+          fail(s"$label hi=0x${hi.toString(16)} want ${expectHi.toString(16)}")
+      }
+    }
+
+    val e0 = BigInt("A5A5A5A5", 16)
+    val e1 = BigInt("5A5A5A5A", 16)
+    runPair(narrow = false, 0x0F, 0xF0, e0, e1, "sparse_obey")
+    runPair(narrow = false, 0xFF, 0xFF, 0, e1, "full_clobber")
+    runPair(narrow = true, 0xFF, 0xFF, e0, e1, "full_narrowed")
   }
 
   test("aw-write-same-time") {
