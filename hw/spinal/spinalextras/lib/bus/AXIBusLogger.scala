@@ -154,4 +154,64 @@ object AXIBusLogger {
   def flows(axis: Axi4Bus*): Seq[(Data, Flow[Bits])] = {
     flows(AllMapping, axis:_*)
   }
+
+  /** AW handshake: ADDR / SIZE / LEN / BURST (named fields for EventLogger decode). */
+  def awMeta(axis: Axi4Bus*): Seq[(Data, Flow[Bits])] = {
+    axis.flatMap(axi => {
+      val (_, aw, _, _, _, _) = decompose(axi)
+      val meta = Flow(new Bundle {
+        val addr = cloneOf(aw.payload.addr)
+        val size = if (aw.payload.size != null) cloneOf(aw.payload.size) else UInt(3 bits)
+        val len = if (aw.payload.len != null) cloneOf(aw.payload.len) else UInt(8 bits)
+        val burst = if (aw.payload.burst != null) cloneOf(aw.payload.burst) else Bits(2 bits)
+      })
+      val awName = Option(aw.getName()).filter(_.nonEmpty).getOrElse("aw")
+      meta.setName(awName + "_meta")
+      meta.valid := aw.fire
+      meta.payload.addr := aw.payload.addr
+      if (aw.payload.size != null) meta.payload.size := aw.payload.size
+      else meta.payload.size := U(log2Up(aw.config.bytePerWord), 3 bits)
+      if (aw.payload.len != null) meta.payload.len := aw.payload.len
+      else meta.payload.len := 0
+      if (aw.payload.burst != null) meta.payload.burst := aw.payload.burst
+      else meta.payload.burst := B(1, 2 bits)
+      Seq(FlowLogger.asFlow(meta))
+    })
+  }
+
+  /** W handshake: last AW ADDR/SIZE/LEN/BURST plus this beat's WSTRB (HIP stencil). */
+  def writeMeta(axis: Axi4Bus*): Seq[(Data, Flow[Bits])] = {
+    axis.flatMap(axi => {
+      val (_, aw, _, _, w, _) = decompose(axi)
+      val lastAddr = RegNextWhen(aw.payload.addr, aw.fire)
+      val lastSize = Reg(UInt(3 bits))
+      val lastLen = Reg(UInt(8 bits))
+      val lastBurst = Reg(Bits(2 bits))
+      val fireSize = if (aw.payload.size != null) aw.payload.size.resize(3 bits) else U(log2Up(aw.config.bytePerWord), 3 bits)
+      val fireLen = if (aw.payload.len != null) aw.payload.len.resize(8 bits) else U(0, 8 bits)
+      val fireBurst = if (aw.payload.burst != null) aw.payload.burst.resize(2 bits) else B(1, 2 bits)
+      when(aw.fire) {
+        lastSize := fireSize
+        lastLen := fireLen
+        lastBurst := fireBurst
+      }
+      val meta = Flow(new Bundle {
+        val addr = cloneOf(aw.payload.addr)
+        val size = UInt(3 bits)
+        val len = UInt(8 bits)
+        val burst = Bits(2 bits)
+        val strb = cloneOf(w.payload.strb)
+      })
+      val awName = Option(aw.getName()).filter(_.nonEmpty).getOrElse("aw")
+      meta.setName(awName + "_wmeta")
+      meta.valid := w.fire
+      // AW+W can fire together; registered last* would then tag this W with the prior AW.
+      meta.payload.addr := Mux(aw.fire, aw.payload.addr, lastAddr)
+      meta.payload.size := Mux(aw.fire, fireSize, lastSize)
+      meta.payload.len := Mux(aw.fire, fireLen, lastLen)
+      meta.payload.burst := Mux(aw.fire, fireBurst, lastBurst)
+      meta.payload.strb := w.payload.strb
+      Seq(FlowLogger.asFlow(meta))
+    })
+  }
 }
